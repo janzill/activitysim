@@ -11,6 +11,7 @@ import pandas as pd
 from . import logit
 from . import tracing
 from . import chunk
+from . import config
 from .simulate import set_skim_wrapper_targets
 
 
@@ -20,6 +21,55 @@ from . import pipeline
 logger = logging.getLogger(__name__)
 
 DUMP = False
+
+
+def make_sample_choices_utility_based(
+        choosers,
+        utilities,
+        sample_size,
+        alternative_count,
+        allow_zero_probs,
+        trace_label
+):
+
+    assert isinstance(utilities, pd.DataFrame)
+    assert utilities.shape == (len(choosers), alternative_count)
+
+    # Note [janzill Jun2022]: this needs for loop for memory like previous method, an array of dimension
+    #   (len(choosers), alternative_count, sample_size) can get very large
+    #choices = np.zeros_like(utilities, dtype=np.uint32)
+    #zero_dim_index = np.arange(utilities.shape[0])
+
+    utils_array = utilities.to_numpy()
+    chunk.log_df(trace_label, 'utils_array', utils_array)
+    chosen_destinations = []
+
+    rands = pipeline.get_rn_generator().gumbel_for_df(utilities, n=alternative_count)
+    chunk.log_df(trace_label, 'rands', rands)
+
+    for i in range(sample_size):
+        #rands = pipeline.get_rn_generator().random_for_df(utilities, n=alternative_count)
+        #choices[zero_dim_index, np.argmax(inverse_ev1_cdf(rands) + utils_array, axis=1)] += 1
+        #choices[
+        #    zero_dim_index,
+        #    np.argmax(pipeline.get_rn_generator().gumbel_for_df(utilities, n=alternative_count) + utils_array, axis=1)
+        #] += 1
+        # created this once for memory logging
+        if i > 0:
+            rands = pipeline.get_rn_generator().gumbel_for_df(utilities, n=alternative_count)
+        chosen_destinations.append(np.argmax(utils_array + rands, axis=1))
+    chosen_destinations = np.concatenate(chosen_destinations, axis=0)
+
+    chunk.log_df(trace_label, 'chosen_destinations', chosen_destinations)
+
+    del utils_array
+    chunk.log_df(trace_label, 'utils_array', None)
+    del rands
+    chunk.log_df(trace_label, 'rands', None)
+
+    chunk.log_df(trace_label, 'chosen_destinations', None)  # handing off to caller
+
+    return chosen_destinations
 
 
 def make_sample_choices(
@@ -47,7 +97,6 @@ def make_sample_choices(
     -------
 
     """
-
     assert isinstance(probs, pd.DataFrame)
     assert probs.shape == (len(choosers), alternative_count)
 
@@ -308,41 +357,74 @@ def _interaction_sample(
 
     tracing.dump_df(DUMP, utilities, trace_label, 'utilities')
 
-    # convert to probabilities (utilities exponentiated and normalized to probs)
-    # probs is same shape as utilities, one row per chooser and one column for alternative
-    probs = logit.utils_to_probs(utilities, allow_zero_probs=allow_zero_probs,
-                                 trace_label=trace_label, trace_choosers=choosers)
-    chunk.log_df(trace_label, 'probs', probs)
+    # sample size 0 is for estimation mode - see below
+    if config.setting("freeze_unobserved_utilities", False) and (sample_size != 0):
 
-    del utilities
-    chunk.log_df(trace_label, 'utilities', None)
+        chosen_alts = make_sample_choices_utility_based(
+            choosers, utilities, sample_size, alternative_count, allow_zero_probs, trace_label
+        )
+        chooser_idx = np.tile(np.arange(utilities.shape[0]), sample_size)
+        #chunk.log_df(trace_label, 'choices_array', choices_array)
+        # choices array has same dim as utilities, with values indicating number of counts per chooser and alternative
+        # let's turn the nonzero values into a dataframe
+        #i, j = np.nonzero(choices_array)
+        chunk.log_df(trace_label, 'chooser_idx', chooser_idx)
+        chunk.log_df(trace_label, 'chosen_alts', chosen_alts)
 
-    if have_trace_targets:
-        tracing.trace_df(probs, tracing.extend_trace_label(trace_label, 'probs'),
-                         column_labels=['alternative', 'probability'])
+        probs = logit.utils_to_probs(utilities, allow_zero_probs=allow_zero_probs,
+                                     trace_label=trace_label, trace_choosers=choosers)
+        chunk.log_df(trace_label, 'probs', probs)
 
-    if sample_size == 0:
-        # FIXME return full alternative set rather than sample
-        logger.info("Estimation mode for %s using unsampled alternatives" % (trace_label, ))
+        del utilities
+        chunk.log_df(trace_label, 'utilities', None)
 
-        index_name = probs.index.name
-        choices_df = \
-            pd.melt(probs.reset_index(), id_vars=[index_name])\
-            .sort_values(by=index_name, kind='mergesort')\
-            .set_index(index_name)\
-            .rename(columns={'value': 'prob'})\
-            .drop(columns='variable')
+        choices_df = pd.DataFrame({
+            alt_col_name: alternatives.index.values[chosen_alts],
+            #"pick_count": choices_array[i, j],
+            "prob": probs.to_numpy()[chooser_idx, chosen_alts],
+            choosers.index.name: choosers.index.values[chooser_idx]
+        })
+        del chooser_idx
+        chunk.log_df(trace_label, 'chooser_idx', None)
+        del chosen_alts
+        chunk.log_df(trace_label, 'chosen_alts', None)
 
-        choices_df['pick_count'] = 1
-        choices_df.insert(0, alt_col_name, np.tile(alternatives.index.values, len(choosers.index)))
-
-        return choices_df
     else:
-        choices_df = make_sample_choices(
-            choosers, probs, alternatives,
-            sample_size, alternative_count, alt_col_name,
-            allow_zero_probs=allow_zero_probs,
-            trace_label=trace_label)
+        # convert to probabilities (utilities exponentiated and normalized to probs)
+        # probs is same shape as utilities, one row per chooser and one column for alternative
+        probs = logit.utils_to_probs(utilities, allow_zero_probs=allow_zero_probs,
+                                     trace_label=trace_label, trace_choosers=choosers)
+        chunk.log_df(trace_label, 'probs', probs)
+
+        del utilities
+        chunk.log_df(trace_label, 'utilities', None)
+
+        if have_trace_targets:
+            tracing.trace_df(probs, tracing.extend_trace_label(trace_label, 'probs'),
+                             column_labels=['alternative', 'probability'])
+
+        if sample_size == 0:
+            # FIXME return full alternative set rather than sample
+            logger.info("Estimation mode for %s using unsampled alternatives" % (trace_label, ))
+
+            index_name = probs.index.name
+            choices_df = \
+                pd.melt(probs.reset_index(), id_vars=[index_name])\
+                .sort_values(by=index_name, kind='mergesort')\
+                .set_index(index_name)\
+                .rename(columns={'value': 'prob'})\
+                .drop(columns='variable')
+
+            choices_df['pick_count'] = 1
+            choices_df.insert(0, alt_col_name, np.tile(alternatives.index.values, len(choosers.index)))
+
+            return choices_df
+        else:
+            choices_df = make_sample_choices(
+                choosers, probs, alternatives,
+                sample_size, alternative_count, alt_col_name,
+                allow_zero_probs=allow_zero_probs,
+                trace_label=trace_label)
 
     chunk.log_df(trace_label, 'choices_df', choices_df)
 
@@ -364,10 +446,11 @@ def _interaction_sample(
     # drop the duplicates
     choices_df = choices_df[~choices_df['pick_dup']]
     del choices_df['pick_dup']
-    chunk.log_df(trace_label, 'choices_df', choices_df)
 
     # set index after groupby so we can trace on it
     choices_df.set_index(choosers.index.name, inplace=True)
+
+    chunk.log_df(trace_label, 'choices_df', choices_df)
 
     tracing.dump_df(DUMP, choices_df, trace_label, 'choices_df')
 
@@ -378,8 +461,8 @@ def _interaction_sample(
                          column_labels=['sample_alt', 'alternative'])
 
     # don't need this after tracing
-    del choices_df['rand']
-    chunk.log_df(trace_label, 'choices_df', choices_df)
+    if not config.setting("freeze_unobserved_utilities", False):
+        del choices_df['rand']
 
     # - NARROW
     choices_df['prob'] = choices_df['prob'].astype(np.float32)
