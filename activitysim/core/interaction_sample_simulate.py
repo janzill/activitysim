@@ -5,7 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from . import chunk, interaction_simulate, logit, tracing
+from . import chunk, config, interaction_simulate, logit, tracing
 from .simulate import set_skim_wrapper_targets
 
 logger = logging.getLogger(__name__)
@@ -227,6 +227,10 @@ def _interaction_sample_simulate(
     utilities_df = pd.DataFrame(padded_utilities, index=choosers.index)
     chunk.log_df(trace_label, "utilities_df", utilities_df)
 
+    if want_logsums:
+        logsums = logit.utils_to_logsums(utilities_df, allow_zero_probs=allow_zero_probs)
+        chunk.log_df(trace_label, 'logsums', logsums)
+
     del padded_utilities
     chunk.log_df(trace_label, "padded_utilities", None)
 
@@ -237,102 +241,91 @@ def _interaction_sample_simulate(
             column_labels=["alternative", "utility"],
         )
 
-    # convert to probabilities (utilities exponentiated and normalized to probs)
-    # probs is same shape as utilities, one row per chooser and one column for alternative
-    probs = logit.utils_to_probs(
-        utilities_df,
-        allow_zero_probs=allow_zero_probs,
-        trace_label=trace_label,
-        trace_choosers=choosers,
-    )
-    chunk.log_df(trace_label, "probs", probs)
-
-    if want_logsums:
-        logsums = logit.utils_to_logsums(
-            utilities_df, allow_zero_probs=allow_zero_probs
-        )
-        chunk.log_df(trace_label, "logsums", logsums)
-
-    del utilities_df
-    chunk.log_df(trace_label, "utilities_df", None)
-
-    if have_trace_targets:
-        tracing.trace_df(
-            probs,
-            tracing.extend_trace_label(trace_label, "probs"),
-            column_labels=["alternative", "probability"],
+    if config.setting("freeze_unobserved_utilities", False):
+        # positions is series with the chosen alternative represented as a column index in utilities_df
+        # which is an integer between zero and num alternatives in the alternative sample
+        positions, rands = logit.make_choices_utility_based(
+            utilities_df, trace_label=trace_label, trace_choosers=choosers
         )
 
-    if allow_zero_probs:
-        zero_probs = probs.sum(axis=1) == 0
-        if zero_probs.any():
-            # FIXME this is kind of gnarly, but we force choice of first alt
-            probs.loc[zero_probs, 0] = 1.0
-
-    if skip_choice:
-        return choosers.join(logsums.to_frame("logsums"))
+        del utilities_df
+        chunk.log_df(trace_label, 'utilities_df', None)
 
     else:
+        # convert to probabilities (utilities exponentiated and normalized to probs)
+        # probs is same shape as utilities, one row per chooser and one column for alternative
+        probs = logit.utils_to_probs(utilities_df, allow_zero_probs=allow_zero_probs,
+                                     trace_label=trace_label, trace_choosers=choosers)
+        chunk.log_df(trace_label, 'probs', probs)
+
+        del utilities_df
+        chunk.log_df(trace_label, 'utilities_df', None)
+
+        if have_trace_targets:
+            tracing.trace_df(probs, tracing.extend_trace_label(trace_label, 'probs'),
+                             column_labels=['alternative', 'probability'])
+
+        if allow_zero_probs:
+            zero_probs = (probs.sum(axis=1) == 0)
+            if zero_probs.any():
+                # FIXME this is kind of gnarly, but we force choice of first alt
+                probs.loc[zero_probs, 0] = 1.0
+
+        if skip_choice:
+            return choosers.join(logsums.to_frame("logsums"))
+        
         # make choices
         # positions is series with the chosen alternative represented as a column index in probs
         # which is an integer between zero and num alternatives in the alternative sample
-        positions, rands = logit.make_choices(
-            probs, trace_label=trace_label, trace_choosers=choosers
-        )
-
-        chunk.log_df(trace_label, "positions", positions)
-        chunk.log_df(trace_label, "rands", rands)
+        positions, rands = \
+            logit.make_choices(probs, trace_label=trace_label, trace_choosers=choosers)
 
         del probs
-        chunk.log_df(trace_label, "probs", None)
+        chunk.log_df(trace_label, 'probs', None)
 
-        # shouldn't have chosen any of the dummy pad utilities
-        assert positions.max() < max_sample_count
+    chunk.log_df(trace_label, 'positions', positions)
+    chunk.log_df(trace_label, 'rands', rands)
 
-        # need to get from an integer offset into the alternative sample to the alternative index
-        # that is, we want the index value of the row that is offset by <position> rows into the
-        # tranche of this choosers alternatives created by cross join of alternatives and choosers
+    # shouldn't have chosen any of the dummy pad utilities
+    assert positions.max() < max_sample_count
 
-        # resulting pandas Int64Index has one element per chooser row and is in same order as choosers
-        choices = alternatives[choice_column].take(positions + first_row_offsets)
+    # need to get from an integer offset into the alternative sample to the alternative index
+    # that is, we want the index value of the row that is offset by <position> rows into the
+    # tranche of this choosers alternatives created by cross join of alternatives and choosers
 
-        # create a series with index from choosers and the index of the chosen alternative
-        choices = pd.Series(choices, index=choosers.index)
+    # resulting pandas Int64Index has one element per chooser row and is in same order as choosers
+    choices = alternatives[choice_column].take(positions + first_row_offsets)
 
-        chunk.log_df(trace_label, "choices", choices)
+    # create a series with index from choosers and the index of the chosen alternative
+    choices = pd.Series(choices, index=choosers.index)
 
-        if allow_zero_probs and zero_probs.any() and zero_prob_choice_val is not None:
+    chunk.log_df(trace_label, 'choices', choices)
+
+    # TODO [janzill Jun2022]: Also for utility based choices?
+    if not config.setting("freeze_unobserved_utilities", False):
+        if allow_zero_probs and zero_probs.any():
             # FIXME this is kind of gnarly, patch choice for zero_probs
             choices.loc[zero_probs] = zero_prob_choice_val
 
-        if have_trace_targets:
-            tracing.trace_df(
-                choices,
-                tracing.extend_trace_label(trace_label, "choices"),
-                columns=[None, trace_choice_name],
-            )
-            tracing.trace_df(
-                rands,
-                tracing.extend_trace_label(trace_label, "rands"),
-                columns=[None, "rand"],
-            )
-            if want_logsums:
-                tracing.trace_df(
-                    logsums,
-                    tracing.extend_trace_label(trace_label, "logsum"),
-                    columns=[None, "logsum"],
-                )
-
+    if have_trace_targets:
+        tracing.trace_df(choices, tracing.extend_trace_label(trace_label, 'choices'),
+                         columns=[None, trace_choice_name])
+        tracing.trace_df(rands, tracing.extend_trace_label(trace_label, 'rands'),
+                         columns=[None, 'rand'])
         if want_logsums:
-            choices = choices.to_frame("choice")
-            choices["logsum"] = logsums
+            tracing.trace_df(logsums, tracing.extend_trace_label(trace_label, 'logsum'),
+                             columns=[None, 'logsum'])
 
-        chunk.log_df(trace_label, "choices", choices)
+    if want_logsums:
+        choices = choices.to_frame("choice")
+        choices["logsum"] = logsums
 
-        # handing this off to our caller
-        chunk.log_df(trace_label, "choices", None)
+    chunk.log_df(trace_label, "choices", choices)
 
-        return choices
+    # handing this off to our caller
+    chunk.log_df(trace_label, "choices", None)
+
+    return choices
 
 
 def interaction_sample_simulate(

@@ -798,31 +798,37 @@ def _interaction_simulate(
 
     tracing.dump_df(DUMP, utilities, trace_label, "utilities")
 
-    # convert to probabilities (utilities exponentiated and normalized to probs)
-    # probs is same shape as utilities, one row per chooser and one column for alternative
-    probs = logit.utils_to_probs(
-        utilities, trace_label=trace_label, trace_choosers=choosers
-    )
-    chunk.log_df(trace_label, "probs", probs)
-
-    del utilities
-    chunk.log_df(trace_label, "utilities", None)
-
-    if have_trace_targets:
-        tracing.trace_df(
-            probs,
-            tracing.extend_trace_label(trace_label, "probs"),
-            column_labels=["alternative", "probability"],
+    if config.setting("freeze_unobserved_utilities", False):
+        positions, rands = logit.make_choices_utility_based(
+            utilities, trace_label=trace_label, trace_choosers=choosers
         )
 
-    # make choices
-    # positions is series with the chosen alternative represented as a column index in probs
-    # which is an integer between zero and num alternatives in the alternative sample
-    positions, rands = logit.make_choices(
-        probs, trace_label=trace_label, trace_choosers=choosers
-    )
-    chunk.log_df(trace_label, "positions", positions)
-    chunk.log_df(trace_label, "rands", rands)
+        del utilities
+        chunk.log_df(trace_label, 'utilities', None)
+
+    else:
+        # convert to probabilities (utilities exponentiated and normalized to probs)
+        # probs is same shape as utilities, one row per chooser and one column for alternative
+        probs = logit.utils_to_probs(utilities, trace_label=trace_label, trace_choosers=choosers)
+        chunk.log_df(trace_label, 'probs', probs)
+
+        if have_trace_targets:
+            tracing.trace_df(probs, tracing.extend_trace_label(trace_label, 'probs'),
+                             column_labels=['alternative', 'probability'])
+
+        del utilities
+        chunk.log_df(trace_label, 'utilities', None)
+
+        # make choices
+        # positions is series with the chosen alternative represented as a column index in probs
+        # which is an integer between zero and num alternatives in the alternative sample
+        positions, rands = logit.make_choices(probs, trace_label=trace_label, trace_choosers=choosers)
+
+        del probs
+        chunk.log_df(trace_label, 'probs', None)
+
+    chunk.log_df(trace_label, 'positions', positions)
+    chunk.log_df(trace_label, 'rands', rands)
 
     # need to get from an integer offset into the alternative sample to the alternative index
     # that is, we want the index value of the row that is offset by <position> rows into the
