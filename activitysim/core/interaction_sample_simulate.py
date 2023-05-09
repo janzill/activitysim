@@ -286,7 +286,7 @@ def _interaction_sample_simulate(
         choices = choices.to_frame('choice')
         choices['logsum'] = logsums
 
-    chunk.log_df(trace_label, 'choices', choices)
+    chunk.log_df(trace_label, 'choices', choices)  # TODO jan: double counting?
 
     # handing this off to our caller
     chunk.log_df(trace_label, 'choices', None)
