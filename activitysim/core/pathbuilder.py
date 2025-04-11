@@ -1009,12 +1009,20 @@ class TransitVirtualPathBuilder:
                         probs["choices"] = choices
                         self.trace_df(probs, trace_label, "probs")
                     else:
-                        choices, rands = logit.make_choices(
-                            self.network_los.state,
-                            probs,
-                            allow_bad_probs=True,
-                            trace_label=trace_label,
-                        )
+                        if self.network_los.state.settings.use_explicit_error_terms:
+                            choices, rands = logit.make_choices_utility_based(
+                                self.network_los.state,
+                                utilities_df,
+                                allow_bad_probs=True,
+                                trace_label=trace_label,
+                            )
+                        else:
+                            choices, rands = logit.make_choices(
+                                self.network_los.state,
+                                probs,
+                                allow_bad_probs=True,
+                                trace_label=trace_label,
+                            )
 
                         chunk_sizer.log_df(trace_label, "rands", rands)
                         del rands

@@ -270,6 +270,109 @@ def utils_to_probs(
     return probs
 
 
+# TODO-EET: check state, add type annotations, check new-world tracing, etc.
+def add_ev1_random(state: workflow.State, df: pd.DataFrame):
+    nest_utils_for_choice = df.copy()
+    nest_utils_for_choice += state.get_rn_generator().gumbel_for_df(
+        nest_utils_for_choice, n=df.shape[1]
+    )
+    return nest_utils_for_choice
+
+
+def choose_from_tree(
+    nest_utils, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+):
+    for level, nest_names in logit_nest_groups.items():
+        if level == 1:
+            next_level_alts = nest_alternatives_by_name[nest_names[0]]
+            continue
+        choice_this_level = nest_utils[nest_utils.index.isin(next_level_alts)].idxmax()
+        if choice_this_level in all_alternatives:
+            return choice_this_level
+        next_level_alts = nest_alternatives_by_name[choice_this_level]
+    raise ValueError("This should never happen - no alternative found")
+
+
+# TODO-EET [janzill Jun2022]: make everything in nested and here numpy from beginning to make choices consistent with
+#  previous impl (want column index and not alternative name)
+# Note: this is relatively slow due to the apply.
+# It could *maybe* be sped up by using the fact that the nesting structure is the same for all rows: Add ev1(0,1) to
+# all entries (as is currently being done). Then, at each level, pick the maximum of the available composite
+# alternatives and set the corresponding entry to 1 for each row, set all other alternatives at this level to zero.
+# Once the tree is walked (all alternatives have been processed), take the product of the alternatives in each
+# leaf's alternative list. Then pick the only alternative with entry 1, all others must be 0.
+def make_choices_explicit_error_term_nl(
+    state, nested_utilities, alt_order_array, nest_spec
+):
+    """walk down the nesting tree and make choice at each level, which is the root of the next level choice."""
+    nest_utils_for_choice = add_ev1_random(state, nested_utilities)
+
+    all_alternatives = set(nest.name for nest in each_nest(nest_spec, type="leaf"))
+    logit_nest_groups = group_nest_names_by_level(nest_spec)
+    nest_alternatives_by_name = {n.name: n.alternatives for n in each_nest(nest_spec)}
+
+    choices = nest_utils_for_choice.apply(
+        lambda x: choose_from_tree(
+            x, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+        ),
+        axis=1,
+    )
+    assert not choices.isnull().any(), "No choice for XXX - implement reporting"
+    choices = pd.Series(choices, index=nest_utils_for_choice.index)
+
+    # In order for choice indexing to be consistent with MNL and cumsum MC choices, we need to index in the order
+    #  alternatives were originally created before adding nest nodes that are not elemental alternatives
+    choices = choices.map({v: k for k, v in enumerate(alt_order_array)})
+
+    return choices
+
+
+def make_choices_explicit_error_term_mnl(state, utilities):
+    utilities_incl_unobs = add_ev1_random(state, utilities)
+    choices = np.argmax(utilities_incl_unobs.to_numpy(), axis=1)
+    # TODO-EET: reporting like for zero probs
+    assert not np.isnan(choices).any(), "No choice for XXX - implement reporting"
+    choices = pd.Series(choices, index=utilities_incl_unobs.index)
+    return choices
+
+
+def make_choices_explicit_error_term(
+    state, utilities, alt_order_array, nest_spec=None, trace_label=None
+):
+    trace_label = tracing.extend_trace_label(trace_label, "make_choices_ru_frozen")
+    if nest_spec is None:
+        choices = make_choices_explicit_error_term_mnl(state, utilities)
+    else:
+        choices = make_choices_explicit_error_term_nl(
+            state, utilities, alt_order_array, nest_spec
+        )
+    return choices
+
+
+# TODO-EET: memory usage
+def make_choices_utility_based(
+    state: workflow.State,
+    utilities: pd.DataFrame,
+    # for nested: need mapping of index to alternative name to "fake" indexes if I want to keep with current
+    #  structure, OR need to make returning names optional. sharrow impl will make our life so much easier
+    name_mapping=None,
+    nest_spec=None,
+    trace_label: str = None,
+    trace_choosers=None,
+    allow_bad_probs=False,
+) -> tuple[pd.Series, pd.Series]:
+    trace_label = tracing.extend_trace_label(trace_label, "make_choices_utility_based")
+
+    # TODO-EET: index of choices for nested utilities is different than unnested - this needs to be consistent for
+    #  turning indexes into alternative names to keep code changes to minimum for now
+    choices = make_choices_explicit_error_term(
+        state, utilities, name_mapping, nest_spec, trace_label
+    )
+    # TODO-EET: rands - log all zeros for now
+    rands = pd.Series(np.zeros_like(utilities.index.values), index=utilities.index)
+    return choices, rands
+
+
 def make_choices(
     state: workflow.State,
     probs: pd.DataFrame,
@@ -279,28 +382,23 @@ def make_choices(
 ) -> tuple[pd.Series, pd.Series]:
     """
     Make choices for each chooser from among a set of alternatives.
-
     Parameters
     ----------
     probs : pandas.DataFrame
         Rows for choosers and columns for the alternatives from which they
         are choosing. Values are expected to be valid probabilities across
         each row, e.g. they should sum to 1.
-
     trace_choosers : pandas.dataframe
         the choosers df (for interaction_simulate) to facilitate the reporting of hh_id
         by report_bad_choices because it can't deduce hh_id from the interaction_dataset
         which is indexed on index values from alternatives df
-
     Returns
     -------
     choices : pandas.Series
         Maps chooser IDs (from `probs` index) to a choice, where the choice
         is an index into the columns of `probs`.
-
     rands : pandas.Series
         The random numbers used to make the choices (for debugging, tracing)
-
     """
     trace_label = tracing.extend_trace_label(trace_label, "make_choices")
 
@@ -541,6 +639,7 @@ def _each_nest(spec: LogitNestSpec, parent_nest, post_order):
         nest.level = parent_nest.level + 1
         nest.product_of_coefficients = parent_nest.product_of_coefficients
         nest.ancestors = parent_nest.ancestors + [name]
+        nest.coefficient = parent_nest.coefficient
 
         yield spec, nest
 
@@ -578,6 +677,7 @@ def each_nest(nest_spec: dict | LogitNestSpec, type=None, post_order=False):
             yield nest
 
 
+# TODO-EET: do I need to implement this for LogitNestSpec?
 def count_nests(nest_spec):
     """
     count the nests in nest_spec, return 0 if nest_spec is none
@@ -595,3 +695,12 @@ def count_nests(nest_spec):
             return 1
 
     return count_each_nest(nest_spec, 0) if nest_spec is not None else 0
+
+
+def group_nest_names_by_level(nest_spec):
+    # group nests by level, returns {level: [nest.name at that level]}
+    depth = np.max([x.level for x in each_nest(nest_spec)])
+    nest_levels = {x: [] for x in range(1, depth + 1)}
+    for n in each_nest(nest_spec):
+        nest_levels[n.level].append(n.name)
+    return nest_levels

@@ -146,7 +146,8 @@ def participants_chooser(
     probs : pandas.DataFrame
         Rows for choosers and columns for the alternatives from which they
         are choosing. Values are expected to be valid probabilities across
-        each row, e.g. they should sum to 1.
+        each row, e.g. they should sum to 1, unless using explicit error terms,
+        in which case values are utilities.
     choosers : pandas.dataframe
         simple_simulate choosers df
     spec : pandas.DataFrame
@@ -206,7 +207,11 @@ def participants_chooser(
             )
             print(unsatisfied_candidates.head(20))
 
-            if model_settings.FORCE_PARTICIPATION:
+            # TODO-EET: explicit error term impl of force participation
+            if (
+                model_settings.FORCE_PARTICIPATION
+                and not state.settings.use_explicit_error_terms
+            ):
                 logger.warning(
                     f"Forcing joint tour participation for {num_tours_remaining} tours."
                 )
@@ -223,9 +228,14 @@ def participants_chooser(
                     f"{num_tours_remaining} tours could not be satisfied after {iter} iterations"
                 )
 
-        choices, rands = logit.make_choices(
-            state, probs, trace_label=trace_label, trace_choosers=choosers
-        )
+        if state.settings.use_explicit_error_terms:
+            choices, rands = logit.make_choices_utility_based(
+                state, probs, trace_label=trace_label, trace_choosers=choosers
+            )
+        else:
+            choices, rands = logit.make_choices(
+                state, probs, trace_label=trace_label, trace_choosers=choosers
+            )
         participate = choices == PARTICIPATE_CHOICE
 
         # satisfaction indexed by tour_id
@@ -417,6 +427,8 @@ def joint_tour_participation(
         if i not in model_settings.compute_settings.protect_columns:
             model_settings.compute_settings.protect_columns.append(i)
 
+    custom_chooser = participants_chooser
+
     choices = simulate.simple_simulate_by_chunk_id(
         state,
         choosers=candidates,
@@ -425,7 +437,7 @@ def joint_tour_participation(
         locals_d=constants,
         trace_label=trace_label,
         trace_choice_name="participation",
-        custom_chooser=participants_chooser,
+        custom_chooser=custom_chooser,
         estimator=estimator,
         compute_settings=model_settings.compute_settings,
     )
